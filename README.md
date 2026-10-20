@@ -1,6 +1,6 @@
 # youtube-auto-dub
 
-[![CI](https://github.com/mangodxd/youtube-auto-dub/actions/workflows/ci.yml/badge.svg)](https://github.com/mangodxd/youtube-auto-dub/actions/workflows/ci.yml)
+[![CI](https://github.com/heyncth/youtube-auto-dub/actions/workflows/ci.yml/badge.svg)](https://github.com/heyncth/youtube-auto-dub/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -16,8 +16,8 @@ YouTube URL → Download → Transcribe (Whisper) → Chunk → Translate (Googl
 
 1. **Download** — video + audio via `yt-dlp`
 2. **Transcribe** — Whisper ASR with VAD and temperature fallback
-3. **Chunk** — groups into natural speech segments (≤10s, split at silences)
-4. **Translate** — Google Translate (RPC → scrape fallback)
+3. **Chunk** — groups into natural speech segments (≤10s, ≤84 chars, split at silences)
+4. **Translate** — Google Translate (RPC → scrape fallback), 25 segments per request
 5. **TTS** — Edge TTS or Qwen3-TTS with voice cloning & personas
 6. **Mix** — tempo-aligned TTS overlaid with optional background music
 7. **Render** — burns subtitles and/or replaces audio via FFmpeg
@@ -43,13 +43,7 @@ sudo apt install ffmpeg
 ### Install
 
 ```bash
-pip install youtube-auto-dub
-```
-
-Or from source:
-
-```bash
-git clone https://github.com/mangodxd/youtube-auto-dub.git
+git clone https://github.com/heyncth/youtube-auto-dub.git
 cd youtube-auto-dub
 pip install .
 ```
@@ -94,7 +88,7 @@ youtube-auto-dub "https://youtube.com/watch?v=VIDEO_ID" -b chrome
 | `--sub-lang` | `-s` | Override subtitle language |
 | `--dub-lang` | `-d` | Override dubbing language |
 | `--gender` | `-g` | `male` or `female` voice (default: `female`) |
-| `--model` | | Whisper model: `tiny`, `base`, `small`, `medium`, `large` |
+| `--model` | | Whisper model: `tiny`, `base`, `small`, `medium`, `large` (default: `base`) |
 | `--browser` | `-b` | Cookie source: `chrome`, `edge`, `firefox` |
 | `--tts-engine` | `-e` | `edge` or `qwen` (default: `edge`) |
 | `--voice` | | Qwen3-TTS persona: `narrator-m`, `young-f`, etc. |
@@ -113,8 +107,8 @@ All defaults are centralized in `youtube_auto_dub/models.py` and can be overridd
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `YAD_CACHE_DIR` | `./.cache` | Download cache |
-| `YAD_TEMP_DIR` | `./temp` | Intermediates |
+| `YAD_CACHE_DIR` | `./.cache` | Download cache + pipeline caches |
+| `YAD_TEMP_DIR` | `./temp` | Intermediates (cleaned by pattern each run) |
 | `YAD_OUTPUT_DIR` | `./output` | Final videos |
 | `YAD_SAMPLE_RATE` | `24000` | TTS / export sample rate |
 | `YAD_AMBIENT_GAIN` | `0.15` | Background music volume |
@@ -134,6 +128,31 @@ Voices are mapped in `youtube_auto_dub/language_map.json`. Edit to add languages
 ```
 
 Common codes: `es` `fr` `de` `it` `pt` `ja` `ko` `zh` `ar` `hi` `ru` `vi` `th`
+
+---
+
+## Caching and reruns
+
+Everything lives in `YAD_CACHE_DIR/<video_id>/`:
+
+| File | Contents |
+|------|----------|
+| `<video_id>.mp4`, `<video_id>.wav` | Source media (re-download skipped when present) |
+| `segments_<model>.json` | Transcription, keyed by Whisper model |
+| `trans_<model>_<src>_<tgt>.json` | Translation, keyed by model and language pair |
+
+A rerun with the same flags skips download, transcription, and translation — it goes straight to TTS and render. Change the Whisper model or target language and only that step re-runs. Delete the video's folder to force a full run.
+
+Files that are re-created each run (`tts_*.wav`, `dub_*.wav`, `subtitles.srt`, ...) are cleaned from `YAD_TEMP_DIR` at startup by pattern; other files in that directory are left alone.
+
+Final videos land in `output/Output_<mode>_<langs>_<video_id>.mp4`.
+
+---
+
+## Errors
+
+- Any failure exits with code `1`, so scripts and cron jobs can detect it.
+- Translation failures abort with the underlying RPC/scrape error. The tool never renders a video with untranslated text labeled as success.
 
 ---
 
@@ -172,16 +191,6 @@ tests/
 **CUDA OOM** — use `--model tiny` or `--model base`.
 
 **YouTube auth errors** — close browser fully before `--browser chrome`.
-
----
-
-## What we're working on
-
-- Speaker diarization (`pyannote.audio`)
-- Background music separation (Demucs)
-- Voice conversion (RVC) post-processing
-- Local LLM translation (offline)
-- Web UI (Gradio / Streamlit)
 
 ---
 
