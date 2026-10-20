@@ -66,19 +66,9 @@ def download_project(url: str, browser: Optional[str] = None) -> ProjectContext:
         )
 
     console.step(f"Downloaded source ({video_id})")
-    project = ProjectContext(
+    return ProjectContext(
         video_id=video_id,
         video_path=video_path,
         audio_path=audio_path,
         metadata=metadata,
     )
-    # Cache metadata for future runs
-    project.save_cache("metadata", {
-        "title": metadata.title,
-        "description": metadata.description,
-        "tags": metadata.tags,
-        "upload_date": metadata.upload_date,
-        "duration": metadata.duration,
-        "channel": metadata.channel,
-    })
-    return project

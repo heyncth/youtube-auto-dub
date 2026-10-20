@@ -3,7 +3,6 @@
 
 import argparse
 import asyncio
-import shutil
 
 from youtube_auto_dub import __version__
 from youtube_auto_dub.core import run
@@ -40,7 +39,7 @@ def _parser() -> argparse.ArgumentParser:
     # ── Model ─────────────────────────────────────────────────────────
     mdl = p.add_argument_group("Model")
     mdl.add_argument("--model", "--whisper",
-                     help="Whisper model size: tiny, base, small, medium, large (default: auto)")
+                     help="Whisper model size: tiny, base, small, medium, large (default: base)")
     mdl.add_argument("-b", "--browser",
                      help="Browser for cookie auth: chrome, edge, firefox")
 
@@ -71,6 +70,21 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+# Only pipeline-owned files: YAD_TEMP_DIR may point at a user directory
+_TEMP_PATTERNS = (
+    "tts_*.wav", "*_sped.wav", "*_slow.wav", "dub_*.wav",
+    "subtitles.srt", "ref.srt", "ambient.wav", "*.loud.wav", "*.amb.wav",
+)
+
+
+def _clean_temp() -> None:
+    if not TEMP_DIR.exists():
+        return
+    for pattern in _TEMP_PATTERNS:
+        for path in TEMP_DIR.glob(pattern):
+            path.unlink(missing_ok=True)
+
+
 def main():
     p = _parser()
     args = p.parse_args()
@@ -81,11 +95,9 @@ def main():
     args.voice_theme = args.voice
     args.auto_clone = args.voice_clone
     args.preserve_bg = args.bg_music
-    args.whisper_model = args.model or getattr(args, "model", None)
+    args.whisper_model = args.model
 
-    # Clean temp
-    if TEMP_DIR.exists():
-        shutil.rmtree(TEMP_DIR, ignore_errors=True)
+    _clean_temp()
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -94,3 +106,4 @@ def main():
         pass
     except Exception as e:
         console.print(f"\n[red]Error: {e}[/red]")
+        raise SystemExit(1)

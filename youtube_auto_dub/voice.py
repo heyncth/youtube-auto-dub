@@ -5,10 +5,12 @@ import json
 import logging
 import subprocess
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
 import edge_tts
+import soundfile as sf
 
 from youtube_auto_dub.models import (
     EDGE_TTS_RETRIES,
@@ -35,9 +37,14 @@ log = logging.getLogger(__name__)
 
 # ── Edge TTS voice lookup ───────────────────────────────────────────────
 
-def pick_voice(lang: str, gender: str = "male") -> str:
+@lru_cache(maxsize=1)
+def _load_lang_map() -> dict:
     with open(LANG_MAP_PATH, encoding="utf-8") as f:
-        data = json.load(f)
+        return json.load(f)
+
+
+def pick_voice(lang: str, gender: str = "male") -> str:
+    data = _load_lang_map()
     if lang not in data:
         raise ValueError(f"Language {lang} not in map")
     voices = data[lang]["voices"].get(gender, [])
@@ -79,6 +86,24 @@ async def speak_edge(text: str, voice: str, dest: Path, retries: int = None, tim
 
 # ── Qwen3-TTS ───────────────────────────────────────────────────────────
 
+_QWEN_CACHE: dict = {}
+
+
+def _qwen_model(device: str):
+    """One model per device: loading it per segment multiplies load time by N."""
+    if device not in _QWEN_CACHE:
+        try:
+            from chatterbox import Chatterbox
+        except ImportError:
+            raise ImportError("Install chatterbox-tts for Qwen3-TTS")
+        _QWEN_CACHE[device] = Chatterbox.from_pretrained(
+            QWEN_MODEL_NAME,
+            device_map=device,
+            dtype=QWEN_COMPUTE_DTYPE,
+        )
+    return _QWEN_CACHE[device]
+
+
 async def speak_qwen(
     text: str,
     dest: Path,
@@ -92,34 +117,25 @@ async def speak_qwen(
         device = QWEN_DEFAULT_DEVICE
     if retries is None:
         retries = EDGE_TTS_RETRIES
-    try:
-        from chatterbox import Chatterbox
-    except ImportError:
-        raise ImportError("Install chatterbox-tts for Qwen3-TTS")
 
     for attempt in range(retries + 1):
         try:
-            model = Chatterbox.from_pretrained(
-                QWEN_MODEL_NAME,
-                device_map=device,
-                dtype=QWEN_COMPUTE_DTYPE,
-            )
+            model = _qwen_model(device)
             audio = model.synthesize(
                 text,
                 voice_sample=str(voice_sample) if voice_sample else None,
                 ref_text=ref_text,
                 language=language,
             )
-            import soundfile as sf
             sf.write(str(dest), audio, SR_TTS)
-            del model
-            import torch
-            torch.cuda.empty_cache()
             if dest.exists() and dest.stat().st_size >= VOICE_MIN_FILE_SIZE:
                 return
             raise RuntimeError("Empty output")
+        except ImportError:
+            raise
         except Exception as e:
             log.warning("Qwen attempt %d: %s", attempt + 1, e)
+            _QWEN_CACHE.pop(device, None)
             dest.unlink(missing_ok=True)
             if attempt < retries:
                 await asyncio.sleep(EDGE_TTS_RETRY_DELAY)
@@ -134,9 +150,9 @@ def resolve_persona(
     lang_code: str,
     device: str = None,
 ) -> tuple[str, str]:
+    """Return (voice_sample_path, ref_text) for a persona."""
     if device is None:
         device = QWEN_DEFAULT_DEVICE
-    """Return (voice_sample_path, ref_text) for a persona."""
     if name not in VOICE_PERSONAS:
         raise ValueError(f"Unknown persona: {name}. Options: {list(VOICE_PERSONAS)}")
     gender, eng_instruct = VOICE_PERSONAS[name]
@@ -149,21 +165,10 @@ def resolve_persona(
     if wav.exists() and wav.stat().st_size > 0:
         return str(wav), ref
 
-    try:
-        import soundfile as sf
-        import torch
-        from chatterbox import Chatterbox
-    except ImportError:
-        raise ImportError("chatterbox-tts required for voice personas")
-
     log.info("Generating persona %s for %s", name, lang)
-    model = Chatterbox.from_pretrained(
-        QWEN_MODEL_NAME, device_map=device, dtype=QWEN_COMPUTE_DTYPE,
-    )
+    model = _qwen_model(device)
     audio = model.design_voice(text=ref, language=lang, instruct=eng_instruct)
     sf.write(wav, audio, SR_TTS)
-    del model
-    torch.cuda.empty_cache()
     return str(wav), ref
 
 

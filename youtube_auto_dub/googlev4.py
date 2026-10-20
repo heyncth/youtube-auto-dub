@@ -1,5 +1,6 @@
 """Google Translate client with RPC and scrape fallback."""
 
+import asyncio
 import json
 import re
 from typing import List
@@ -16,12 +17,15 @@ from youtube_auto_dub.models import (
 )
 from youtube_auto_dub.ui import console
 
+BATCH_CHUNK = 25
+BATCH_CONCURRENCY = 4
+
 
 class GoogleTranslator:
     """Google Translate client with RPC (primary) and web scrape (fallback)."""
 
     def __init__(self):
-        self.client = httpx.AsyncClient(timeout=TRANSLATE_TIMEOUT)
+        self.client = httpx.AsyncClient(timeout=TRANSLATE_TIMEOUT, follow_redirects=True)
         self.base_url_rpc = TRANSLATE_API_URL
         self.base_url_scrape = TRANSLATE_SCRAPE_URL
         self.headers = {"User-Agent": TRANSLATE_USER_AGENT}
@@ -72,7 +76,7 @@ class GoogleTranslator:
         if response.status_code != 200:
             raise Exception(f"RPC HTTP Error: {response.status_code}")
 
-        return self._parse_rpc_response(response.text)
+        return await self._parse_rpc_response(response.text)
 
     async def _translate_scrape(self, text, source, target):
         """Method 2: Web scraping. Simple fallback."""
@@ -95,7 +99,11 @@ class GoogleTranslator:
         return element.get_text(strip=True)
 
     async def translate(self, text, source="auto", target="vi"):
-        """Main interface. Tries RPC first, falls back to scraping."""
+        """Main interface. Tries RPC first, falls back to scraping.
+
+        Raises RuntimeError when both methods fail: returning the input text
+        here would render an untranslated video as if it succeeded.
+        """
         if not text:
             return ""
 
@@ -103,31 +111,47 @@ class GoogleTranslator:
         if source != "auto" and source == target:
             return text
 
+        errors = []
+
         # Try RPC API first
         try:
             return await self._translate_rpc(text, source, target)
-        except Exception:
-            pass
+        except Exception as e:
+            errors.append(f"rpc: {e}")
 
         # Try scrape fallback
         try:
             return await self._translate_scrape(text, source, target)
         except Exception as e:
-            console.error(f"All translation methods failed: {e}")
-            return text
+            errors.append(f"scrape: {e}")
+
+        console.error(f"All translation methods failed: {'; '.join(errors)}")
+        raise RuntimeError(f"Translation failed for target {target} ({'; '.join(errors)})")
 
     async def translate_batch(self, texts: List[str], target: str, source: str = "auto") -> List[str]:
-        """Translate a batch of texts, falling back to individual translation if batch fails."""
+        """Translate texts in small chunks (large GET queries get HTTP 400)."""
         delimiter = "\n\n|||\n\n"
-        combined = delimiter.join([t if t.strip() else " " for t in texts])
+        out: List[str] = []
 
-        translated_combined = await self.translate(combined, source=source, target=target)
-        results = [t.strip() for t in translated_combined.split(delimiter.strip())]
+        for i in range(0, len(texts), BATCH_CHUNK):
+            chunk = texts[i:i + BATCH_CHUNK]
+            combined = delimiter.join([t if t.strip() else " " for t in chunk])
+            translated = await self.translate(combined, source=source, target=target)
+            results = [t.strip() for t in translated.split("|||")]
+            if len(results) == len(chunk):
+                out.extend(results)
+                continue
 
-        if len(results) != len(texts):
-            results = [await self.translate(t, source=source, target=target) for t in texts]
+            # Delimiter lost in translation — fall back per text, bounded concurrency
+            sem = asyncio.Semaphore(BATCH_CONCURRENCY)
 
-        return results
+            async def one(t: str) -> str:
+                async with sem:
+                    return (await self.translate(t, source=source, target=target)).strip()
+
+            out.extend(await asyncio.gather(*[one(t) for t in chunk]))
+
+        return out
 
     async def close(self):
         await self.client.aclose()

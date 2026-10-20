@@ -93,6 +93,7 @@ DEFAULT_GENDER = "female"
 EDGE_TTS_RETRIES = 2
 EDGE_TTS_TIMEOUT = 60
 EDGE_TTS_RETRY_DELAY = 2
+TTS_CONCURRENCY = 4
 QWEN_MODEL_NAME = "chatterbox-tts/qwen3-tts"
 QWEN_COMPUTE_DTYPE = "bfloat16"
 QWEN_DEFAULT_DEVICE = "cuda:0"
@@ -232,7 +233,6 @@ class ProjectContext:
     segments: List[SubtitleSegment] = field(default_factory=list)
     subtitle_path: Optional[Path] = None
     dub_audio_path: Optional[Path] = None
-    output_path: Optional[Path] = None
     metadata: Optional[VideoMetadata] = None
 
     @property
@@ -252,6 +252,3 @@ class ProjectContext:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         return None
-
-    def has_cache(self, key: str) -> bool:
-        return (self.project_dir / f"{key}.json").exists()

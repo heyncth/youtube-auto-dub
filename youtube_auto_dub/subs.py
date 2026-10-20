@@ -1,7 +1,7 @@
 """Subtitle parsing, splitting, and SRT generation — single unified layer."""
 
 import re
-from typing import List, Tuple
+from typing import List
 
 from youtube_auto_dub.models import SUBTITLE_MAX_CHARS, SUBTITLE_MAX_DUR
 
@@ -10,14 +10,6 @@ def _ts_to_sec(ts: str) -> float:
     h, m, r = ts.split(":")
     s, ms = r.split(",")
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
-
-
-def _fmt_ts(sec: float) -> str:
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = int(sec % 60)
-    ms = int(round((sec % 1) * 1000))
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
 def parse_srt(text: str) -> List[dict]:
@@ -41,16 +33,6 @@ def parse_srt(text: str) -> List[dict]:
 def read_srt(path: str) -> List[dict]:
     with open(path, encoding="utf-8") as f:
         return parse_srt(f.read())
-
-
-def build_srt(blocks: List[Tuple[float, float, str]]) -> str:
-    lines = []
-    for i, (s, e, t) in enumerate(blocks, 1):
-        lines.append(str(i))
-        lines.append(f"{_fmt_ts(s)} --> {_fmt_ts(e)}")
-        lines.append(t)
-        lines.append("")
-    return "\n".join(lines)
 
 
 # ── Smart segment splitting ────────────────────────────────────────────

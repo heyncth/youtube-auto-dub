@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -9,7 +10,6 @@ from typing import List, Optional
 
 import numpy as np
 import soundfile as sf
-from pydub import AudioSegment
 
 from youtube_auto_dub.models import (
     AUDIO_CROSSFADE_IN_MS,
@@ -31,6 +31,7 @@ from youtube_auto_dub.models import (
     SEGMENT_GAP_THRESHOLD,
     SEGMENT_MAX_DURATION,
     SR_TTS,
+    SUBTITLE_MAX_CHARS,
     TEMPO_GAP_MS,
     TEMPO_MAX_SPEED,
     TEMPO_OVERBUDGET_RATIO,
@@ -51,26 +52,33 @@ SR = SR_TTS
 def group_segments(raw: List[dict]) -> List[SubtitleSegment]:
     if not raw:
         return []
-    out, buf = [], [raw[0]]
-    for cur in raw[1:]:
-        prev = buf[-1]
-        gap = cur["start"] - prev["end"]
-        dur = cur["end"] - buf[0]["start"]
-        if gap > SEGMENT_GAP_THRESHOLD or dur > SEGMENT_MAX_DURATION:
-            out.append(SubtitleSegment(
-                start=buf[0]["start"],
-                end=buf[-1]["end"],
-                source_text=" ".join(s["text"] for s in buf).strip(),
-            ))
-            buf = [cur]
-        else:
-            buf.append(cur)
-    if buf:
-        out.append(SubtitleSegment(
+
+    def emit(buf: List[dict]) -> SubtitleSegment:
+        return SubtitleSegment(
             start=buf[0]["start"],
             end=buf[-1]["end"],
             source_text=" ".join(s["text"] for s in buf).strip(),
-        ))
+        )
+
+    def fits(buf: List[dict], cur: dict) -> bool:
+        gap = cur["start"] - buf[-1]["end"]
+        dur = cur["end"] - buf[0]["start"]
+        text_len = len(" ".join(s["text"] for s in buf)) + 1 + len(cur["text"])
+        return (
+            gap <= SEGMENT_GAP_THRESHOLD
+            and dur <= SEGMENT_MAX_DURATION
+            and text_len <= SUBTITLE_MAX_CHARS
+        )
+
+    out, buf = [], [raw[0]]
+    for cur in raw[1:]:
+        if fits(buf, cur):
+            buf.append(cur)
+        else:
+            out.append(emit(buf))
+            buf = [cur]
+    if buf:
+        out.append(emit(buf))
     console.step(f"Grouped {len(out)} segments")
     return out
 
@@ -95,12 +103,30 @@ def write_srt(segments: List[SubtitleSegment], path: Path):
 # ── Simple overlay mixing ───────────────────────────────────────────────
 
 def overlay_dub(source_audio: Path, segments: List[SubtitleSegment], output: Path):
-    base = AudioSegment.from_file(source_audio) - abs(AUDIO_DUB_GAIN_DB)
+    base = _load_raw(source_audio, SR) * (10 ** (AUDIO_DUB_GAIN_DB / 20))
     for seg in segments:
         if seg.tts_audio_path and seg.tts_audio_path.exists():
-            clip = AudioSegment.from_file(seg.tts_audio_path)
-            base = base.overlay(clip, position=int(seg.start * 1000))
-    base.export(output, format="wav")
+            clip = _load_raw(seg.tts_audio_path, SR)
+            i = int(seg.start * SR)
+            n = min(len(clip), len(base) - i)
+            if n > 0:
+                base[i:i + n] += clip[:n]
+    pk = np.max(np.abs(base))
+    if pk > 1.0:
+        base /= pk
+    sf.write(output, base.astype(np.float32), SR)
+
+
+def build_align_info(segments: List[SubtitleSegment]) -> List[dict]:
+    """Tempo budget input: target_dur is the source slot, not the TTS length.
+
+    Using the TTS length here would make budget >= actual always, so the
+    speed-up branch could never fire and long clips would overlap.
+    """
+    return [
+        {"start": seg.start, "target_dur": seg.duration, "wav_path": seg.tts_audio_path}
+        for seg in segments
+    ]
 
 
 # ── Tempo alignment engine ──────────────────────────────────────────────
@@ -258,7 +284,6 @@ def _loudness(path: Path) -> float:
          "-af", "loudnorm=print_format=json", "-f", "null", "-"],
         capture_output=True, text=True,
     )
-    import re
     m = re.search(r'\{[^}]+"input_i"[^}]+\}', res.stderr, re.DOTALL)
     if m:
         return float(json.loads(m.group())["input_i"])
@@ -314,9 +339,9 @@ def finalize_audio(
         if result and result.exists():
             dur = sf.info(str(work)).duration
             tmp = output.with_name(output.name + ".amb.wav")
+            # Gain applied once, via amix weights only
             filt = (
-                f"[1:a]atrim=0:{dur:.3f},asetpts=PTS-STARTPTS,"
-                f"volume={ambient_gain:.2f}[bg];"
+                f"[1:a]atrim=0:{dur:.3f},asetpts=PTS-STARTPTS[bg];"
                 f"[0:a][bg]amix=inputs=2:duration=first:weights=1 {ambient_gain:.2f}[out]"
             )
             subprocess.run(
@@ -338,15 +363,6 @@ def finalize_audio(
 
 # ── Video muxing ────────────────────────────────────────────────────────
 
-def mux_video(video: Path, audio: Path, output: Path):
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(video), "-i", str(audio),
-         "-c:v", FFMPEG_MUX_VIDEO_CODEC, "-map", "0:v:0", "-map", "1:a:0",
-         "-shortest", str(output)],
-        check=True, capture_output=True,
-    )
-
-
 def render_video(
     video_path: Path,
     subtitle_path: Optional[Path],
@@ -361,8 +377,10 @@ def render_video(
         sp = str(subtitle_path.resolve()).replace("\\", "/").replace(":", "\\:")
         vf.append(f"subtitles='{sp}'")
     if vf:
-        cmd.extend(["-vf", ",".join(vf)])
-    cmd.extend(["-c:v", FFMPEG_VIDEO_CODEC])
+        cmd.extend(["-vf", ",".join(vf), "-c:v", FFMPEG_VIDEO_CODEC])
+    else:
+        # Nothing burned in: stream-copy instead of a full re-encode
+        cmd.extend(["-c:v", FFMPEG_MUX_VIDEO_CODEC])
     if dub_audio_path:
         cmd.extend(["-c:a", FFMPEG_AUDIO_CODEC, "-map", "0:v:0", "-map", "1:a:0"])
     else:

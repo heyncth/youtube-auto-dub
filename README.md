@@ -157,6 +157,7 @@ youtube_auto_dub/
 tests/
 ├── test_models.py    # Dataclass tests
 ├── test_googlev4.py  # Translation logic tests (no network)
+├── test_audio.py     # Grouping + tempo budget tests
 └── test_voice.py     # Voice lookup tests
 .github/workflows/
 └── ci.yml            # Ruff lint + pytest

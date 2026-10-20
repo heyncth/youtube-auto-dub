@@ -54,7 +54,6 @@ class TestProjectContext:
         assert ctx.segments == []
         assert ctx.subtitle_path is None
         assert ctx.dub_audio_path is None
-        assert ctx.output_path is None
 
 
 class TestPathConstants:

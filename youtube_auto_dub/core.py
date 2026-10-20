@@ -9,6 +9,7 @@ from rich.table import Table
 
 from youtube_auto_dub.audio import (
     align_segments,
+    build_align_info,
     finalize_audio,
     group_segments,
     overlay_dub,
@@ -19,8 +20,8 @@ from youtube_auto_dub.googlev4 import GoogleTranslator
 from youtube_auto_dub.models import (
     AUDIO_DEFAULT_AMBIENT_GAIN,
     DEFAULT_TTS_ENGINE,
-    SR_TTS,
     TEMP_DIR,
+    TTS_CONCURRENCY,
     WHISPER_DEFAULT_MODEL,
     SubtitleSegment,
 )
@@ -83,7 +84,8 @@ async def run(args) -> None:
         # ── 2. Transcribe ────────────────────────────────────────────
         console.info(f"Transcribing ({model_name})")
 
-        cached = project.load_cache("segments")
+        seg_cache_key = f"segments_{model_name}"
+        cached = project.load_cache(seg_cache_key)
         if cached:
             console.step("Using cached transcription")
             project.segments = [
@@ -102,6 +104,7 @@ async def run(args) -> None:
                 model_name=model_name,
                 device=device,
                 hint=hint,
+                use_vad=not getattr(args, "no_vad", False),
             )
             console.success(f"Detected: {lang_detected}")
 
@@ -113,24 +116,38 @@ async def run(args) -> None:
                  "source_text": s.source_text, "lang": lang_detected}
                 for i, s in enumerate(project.segments)
             ]
-            project.save_cache("segments", cache_data)
+            project.save_cache(seg_cache_key, cache_data)
 
         texts = [seg.source_text for seg in project.segments]
 
         # ── 3. Translate ─────────────────────────────────────────────
         console.info("Translating")
 
+        async def translate_cached(target: str) -> list:
+            """Reuse cached output: reruns must not re-translate the video."""
+            key = f"trans_{model_name}_{lang_detected}_{target}"
+            hit = project.load_cache(key)
+            if isinstance(hit, list) and len(hit) == len(texts):
+                console.step(f"Using cached translation -> {target.upper()}")
+                return hit
+            console.step(f"Translating {len(texts)} segs -> {target.upper()}")
+            xl = GoogleTranslator()
+            try:
+                out = await xl.translate_batch(
+                    texts, source=lang_detected or "auto", target=target
+                )
+            finally:
+                await xl.close()
+            project.save_cache(key, out)
+            return out
+
+        sub_out = dub_out = texts
         if args.mode in ("sub", "both"):
             if lang_detected and lang_detected == sub_lang:
                 console.step(f"Source == target ({sub_lang}), skipping")
                 sub_out = texts
             else:
-                console.step(f"Translating {len(texts)} segs -> {sub_lang.upper()}")
-                xl = GoogleTranslator()
-                sub_out = await xl.translate_batch(
-                    texts, source=lang_detected or "auto", target=sub_lang
-                )
-                await xl.close()
+                sub_out = await translate_cached(sub_lang)
             for i, seg in enumerate(project.segments):
                 seg.translated_text_sub = sub_out[i].strip() or seg.source_text
 
@@ -142,12 +159,7 @@ async def run(args) -> None:
                 console.step(f"Source == target ({dub_lang}), skipping")
                 dub_out = texts
             else:
-                console.step(f"Translating {len(texts)} segs -> {dub_lang.upper()}")
-                xl = GoogleTranslator()
-                dub_out = await xl.translate_batch(
-                    texts, source=lang_detected or "auto", target=dub_lang
-                )
-                await xl.close()
+                dub_out = await translate_cached(dub_lang)
             for i, seg in enumerate(project.segments):
                 seg.translated_text_dub = dub_out[i].strip() or seg.source_text
 
@@ -174,6 +186,14 @@ async def run(args) -> None:
                 console.step(f"Persona: {persona}")
 
             # Generate TTS per segment
+            voice = pick_voice(dub_lang, args.gender) if tts_engine != "qwen" else None
+            sem = asyncio.Semaphore(TTS_CONCURRENCY)
+
+            async def run_edge(text: str, dest: Path) -> None:
+                # Bounded: hundreds of parallel requests get rate-limited
+                async with sem:
+                    await speak_edge(text, voice, dest)
+
             tasks = []
             for i, seg in enumerate(project.segments):
                 seg.tts_audio_path = TEMP_DIR / f"tts_{i}.wav"
@@ -185,9 +205,7 @@ async def run(args) -> None:
                         device=f"{device}:0",
                     ))
                 else:
-                    voice = pick_voice(dub_lang, args.gender)
-                    tasks.append(speak_edge(seg.translated_text_dub, voice,
-                                            seg.tts_audio_path))
+                    tasks.append(run_edge(seg.translated_text_dub, seg.tts_audio_path))
 
             await asyncio.gather(*tasks)
 
@@ -195,21 +213,9 @@ async def run(args) -> None:
             project.dub_audio_path = TEMP_DIR / "dub_final.wav"
 
             if use_tempo:
-                info_list = []
-                for seg in project.segments:
-                    tts_dur = 0.0
-                    if seg.tts_audio_path and seg.tts_audio_path.exists():
-                        import soundfile as sf
-                        tts_dur = len(sf.read(seg.tts_audio_path, dtype="float32")[0]) / SR_TTS
-                    info_list.append({
-                        "start": seg.start,
-                        "target_dur": tts_dur,
-                        "wav_path": seg.tts_audio_path,
-                    })
-
                 src_dur = float(project.metadata.duration) if project.metadata else 0.0
                 raw_mix = TEMP_DIR / "dub_raw.wav"
-                align_segments(info_list, src_dur, raw_mix)
+                align_segments(build_align_info(project.segments), src_dur, raw_mix)
                 finalize_audio(
                     raw_mix, project.audio_path,
                     project.dub_audio_path,
